@@ -1,6 +1,7 @@
-"""Supabase PostgreSQL 기반 음성채널 기록 및 미접속 경고 관리."""
+"""Supabase PostgreSQL 기반 음성채널 기록 및 관리자 패널."""
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import io
 import math
@@ -12,7 +13,6 @@ import psycopg
 from discord import app_commands
 from discord.ext import commands, tasks
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
 from psycopg.rows import dict_row
 
 ADMIN_USER_ID = 324558739921305602
@@ -25,13 +25,16 @@ def now() -> dt.datetime:
     return dt.datetime.now(KST)
 
 
-def parse_time(value: str | dt.datetime | None) -> dt.datetime | None:
+def db() -> psycopg.Connection:
+    if not DATABASE_URL:
+        raise RuntimeError("SUPABASE_DB_URL 환경변수가 없습니다")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
+
+
+def parse_time(value):
     if value is None:
         return None
-    if isinstance(value, dt.datetime):
-        parsed = value
-    else:
-        parsed = dt.datetime.fromisoformat(value)
+    parsed = value if isinstance(value, dt.datetime) else dt.datetime.fromisoformat(value)
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=KST)
 
 
@@ -39,7 +42,7 @@ def duration_text(seconds: int) -> str:
     days, rem = divmod(max(0, seconds), 86400)
     hours, rem = divmod(rem, 3600)
     minutes = rem // 60
-    parts: list[str] = []
+    parts = []
     if days:
         parts.append(f"{days}일")
     if hours:
@@ -48,53 +51,41 @@ def duration_text(seconds: int) -> str:
     return " ".join(parts)
 
 
-def db() -> psycopg.Connection:
-    if not DATABASE_URL:
-        raise RuntimeError("SUPABASE_DB_URL 환경변수가 설정되지 않았습니다.")
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15)
-
-
-def verify_database() -> None:
+def verify_database() -> str:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-            cur.fetchone()
+            cur.execute("select current_database() as name, now() as checked_at")
+            row = cur.fetchone()
+            return str(row["name"])
 
 
-def ensure_member(member: discord.Member) -> None:
-    if member.bot:
-        return
+def ensure_members(guild: discord.Guild) -> None:
     current = now()
+    rows = [(guild.id, m.id, m.display_name, current, current) for m in guild.members if not m.bot]
+    if not rows:
+        return
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
+            cur.executemany(
                 """
-                INSERT INTO public.discordbot_member_activity(
-                    guild_id,user_id,display_name,baseline_at,updated_at
-                ) VALUES(%s,%s,%s,%s,%s)
-                ON CONFLICT(guild_id,user_id)
-                DO UPDATE SET display_name=EXCLUDED.display_name, updated_at=EXCLUDED.updated_at
+                insert into public.discordbot_member_activity
+                (guild_id,user_id,display_name,baseline_at,updated_at)
+                values(%s,%s,%s,%s,%s)
+                on conflict(guild_id,user_id)
+                do update set display_name=excluded.display_name,updated_at=excluded.updated_at
                 """,
-                (member.guild.id, member.id, member.display_name, current, current),
+                rows,
             )
-
-
-def fetch_activity(guild_id: int) -> list[dict]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM public.discordbot_member_activity WHERE guild_id=%s",
-                (guild_id,),
-            )
-            return list(cur.fetchall())
 
 
 def activity_rows(guild: discord.Guild) -> list[dict]:
+    ensure_members(guild)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select * from public.discordbot_member_activity where guild_id=%s", (guild.id,))
+            saved = {int(r["user_id"]): r for r in cur.fetchall()}
     current = now()
-    for member in guild.members:
-        ensure_member(member)
-    saved = {int(row["user_id"]): row for row in fetch_activity(guild.id)}
-    rows: list[dict] = []
+    result = []
     for member in guild.members:
         if member.bot:
             continue
@@ -102,13 +93,13 @@ def activity_rows(guild: discord.Guild) -> list[dict]:
         baseline = parse_time(row["baseline_at"]) if row else current
         last_voice = parse_time(row["last_voice_at"]) if row else None
         reference = last_voice or baseline or current
-        rows.append({
+        result.append({
             "member": member,
             "last_voice": last_voice,
             "inactive_seconds": max(0, int((current - reference).total_seconds())),
             "warnings": int(row["warning_count"]) if row else 0,
         })
-    return sorted(rows, key=lambda item: item["inactive_seconds"], reverse=True)
+    return sorted(result, key=lambda r: r["inactive_seconds"], reverse=True)
 
 
 def authorized(interaction: discord.Interaction) -> bool:
@@ -116,11 +107,14 @@ def authorized(interaction: discord.Interaction) -> bool:
 
 
 async def deny(interaction: discord.Interaction) -> None:
-    text = "이 기능은 지정된 관리자만 사용할 수 있습니다."
-    if interaction.response.is_done():
-        await interaction.followup.send(text, ephemeral=True)
-    else:
-        await interaction.response.send_message(text, ephemeral=True)
+    await interaction.response.send_message("이 기능은 지정된 관리자만 사용할 수 있습니다.", ephemeral=True)
+
+
+async def db_error(interaction: discord.Interaction, exc: Exception) -> None:
+    await interaction.followup.send(
+        f"❌ Supabase DB 연결 실패\n오류: `{type(exc).__name__}`\nRailway의 `SUPABASE_DB_URL` 값을 확인해주세요.",
+        ephemeral=True,
+    )
 
 
 class VoiceAuditView(discord.ui.View):
@@ -135,81 +129,74 @@ class VoiceAuditView(discord.ui.View):
         return False
 
     @discord.ui.button(label="전체 멤버 현황", emoji="👥", style=discord.ButtonStyle.primary)
-    async def members(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message(embed=self.cog.member_embed(interaction.guild), ephemeral=True)
-
-    @discord.ui.button(label="경고 현황", emoji="⚠️", style=discord.ButtonStyle.danger)
-    async def warnings(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message(embed=self.cog.warning_embed(interaction.guild), ephemeral=True)
+    async def members(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed = await asyncio.to_thread(self.cog.member_embed, interaction.guild)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
     @discord.ui.button(label="최근 입퇴장", emoji="🎙️", style=discord.ButtonStyle.secondary)
-    async def recent(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message(embed=self.cog.recent_embed(interaction.guild), ephemeral=True)
+    async def recent(self, interaction: discord.Interaction, _: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            embed = await asyncio.to_thread(self.cog.recent_embed, interaction.guild)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
     @discord.ui.button(label="즉시 경고 점검", emoji="🔍", style=discord.ButtonStyle.success)
-    async def check(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    async def warnings(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        count = await self.cog.check_warnings(interaction.guild)
-        await interaction.followup.send(f"새 경고 **{count}회**를 부여했습니다.", ephemeral=True)
+        try:
+            count = await asyncio.to_thread(self.cog.check_warnings, interaction.guild)
+            await interaction.followup.send(f"새 경고 **{count}회**를 부여했습니다.", ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
     @discord.ui.button(label="Excel 출력", emoji="📊", style=discord.ButtonStyle.success)
-    async def excel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    async def excel(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(file=self.cog.make_excel(interaction.guild), ephemeral=True)
+        try:
+            file = await asyncio.to_thread(self.cog.make_excel, interaction.guild)
+            await interaction.followup.send(file=file, ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
 
 class VoiceAuditCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.active: dict[tuple[int, int], tuple[dt.datetime, int, str]] = {}
-        verify_database()
         self.warning_loop.start()
 
-    def cog_unload(self) -> None:
+    def cog_unload(self):
         self.warning_loop.cancel()
 
     @commands.Cog.listener()
-    async def on_ready(self) -> None:
+    async def on_ready(self):
         current = now()
         for guild in self.bot.guilds:
-            for member in guild.members:
-                ensure_member(member)
+            try:
+                await asyncio.to_thread(ensure_members, guild)
+            except Exception:
+                continue
             for channel in guild.voice_channels:
                 for member in channel.members:
                     if not member.bot:
                         self.active[(guild.id, member.id)] = (current, channel.id, channel.name)
-                        self.touch_voice(member, current)
 
     @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member) -> None:
-        ensure_member(member)
-
-    def touch_voice(self, member: discord.Member, at: dt.datetime) -> None:
-        ensure_member(member)
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE public.discordbot_member_activity
-                    SET display_name=%s,last_voice_at=%s,updated_at=%s
-                    WHERE guild_id=%s AND user_id=%s
-                    """,
-                    (member.display_name, at, at, member.guild.id, member.id),
-                )
-
-    @commands.Cog.listener()
-    async def on_voice_state_update(
-        self,
-        member: discord.Member,
-        before: discord.VoiceState,
-        after: discord.VoiceState,
-    ) -> None:
+    async def on_voice_state_update(self, member, before, after):
         if member.bot or before.channel == after.channel:
             return
+        await asyncio.to_thread(self.record_voice_change, member, before, after)
+
+    def record_voice_change(self, member, before, after):
+        ensure_members(member.guild)
         current = now()
         key = (member.guild.id, member.id)
-        ensure_member(member)
-
         if before.channel is not None:
             session = self.active.pop(key, None)
             if session:
@@ -218,106 +205,68 @@ class VoiceAuditCog(commands.Cog):
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
-                            """
-                            INSERT INTO public.discordbot_voice_sessions(
-                                guild_id,user_id,display_name,channel_id,channel_name,
-                                joined_at,left_at,duration_seconds
-                            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
-                            """,
-                            (
-                                member.guild.id,
-                                member.id,
-                                member.display_name,
-                                channel_id,
-                                channel_name,
-                                joined,
-                                current,
-                                seconds,
-                            ),
+                            """insert into public.discordbot_voice_sessions
+                            (guild_id,user_id,display_name,channel_id,channel_name,joined_at,left_at,duration_seconds)
+                            values(%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            (member.guild.id,member.id,member.display_name,channel_id,channel_name,joined,current,seconds),
                         )
                         cur.execute(
-                            """
-                            UPDATE public.discordbot_member_activity
-                            SET display_name=%s,last_voice_at=%s,updated_at=%s
-                            WHERE guild_id=%s AND user_id=%s
-                            """,
-                            (member.display_name, current, current, member.guild.id, member.id),
+                            """update public.discordbot_member_activity set last_voice_at=%s,updated_at=%s
+                            where guild_id=%s and user_id=%s""",
+                            (current,current,member.guild.id,member.id),
                         )
-
         if after.channel is not None:
             self.active[key] = (current, after.channel.id, after.channel.name)
-            self.touch_voice(member, current)
-
-    async def check_warnings(self, guild: discord.Guild) -> int:
-        current = now()
-        total = 0
-        for member in guild.members:
-            if member.bot:
-                continue
-            ensure_member(member)
             with db() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
-                        SELECT * FROM public.discordbot_member_activity
-                        WHERE guild_id=%s AND user_id=%s
-                        """,
-                        (guild.id, member.id),
+                        """update public.discordbot_member_activity set last_voice_at=%s,updated_at=%s
+                        where guild_id=%s and user_id=%s""",
+                        (current,current,member.guild.id,member.id),
                     )
-                    row = cur.fetchone()
-                    if not row:
-                        continue
-                    baseline = parse_time(row["baseline_at"]) or current
-                    last_voice = parse_time(row["last_voice_at"])
-                    last_warning = parse_time(row["last_warning_at"])
-                    reference = max(value for value in (baseline, last_voice, last_warning) if value)
-                    count = math.floor((current - reference).total_seconds() / (WARNING_DAYS * 86400))
+
+    def check_warnings(self, guild: discord.Guild) -> int:
+        rows = activity_rows(guild)
+        current = now()
+        total = 0
+        with db() as conn:
+            with conn.cursor() as cur:
+                for item in rows:
+                    count = math.floor(item["inactive_seconds"] / (WARNING_DAYS * 86400)) - item["warnings"]
                     if count <= 0:
                         continue
-                    warning_time = reference + dt.timedelta(days=WARNING_DAYS * count)
+                    member = item["member"]
                     cur.execute(
-                        """
-                        UPDATE public.discordbot_member_activity
-                        SET warning_count=warning_count+%s,last_warning_at=%s,updated_at=%s
-                        WHERE guild_id=%s AND user_id=%s
-                        """,
-                        (count, warning_time, current, guild.id, member.id),
+                        """update public.discordbot_member_activity
+                        set warning_count=warning_count+%s,last_warning_at=%s,updated_at=%s
+                        where guild_id=%s and user_id=%s""",
+                        (count,current,current,guild.id,member.id),
                     )
-                    for index in range(count):
-                        awarded = reference + dt.timedelta(days=WARNING_DAYS * (index + 1))
+                    for _ in range(count):
                         cur.execute(
-                            """
-                            INSERT INTO public.discordbot_warning_history(
-                                guild_id,user_id,display_name,awarded_at,inactivity_days,reason
-                            ) VALUES(%s,%s,%s,%s,%s,%s)
-                            """,
-                            (
-                                guild.id,
-                                member.id,
-                                member.display_name,
-                                awarded,
-                                WARNING_DAYS,
-                                "음성채널 7일 미접속",
-                            ),
+                            """insert into public.discordbot_warning_history
+                            (guild_id,user_id,display_name,awarded_at,inactivity_days,reason)
+                            values(%s,%s,%s,%s,%s,%s)""",
+                            (guild.id,member.id,member.display_name,current,WARNING_DAYS,"음성채널 7일 미접속"),
                         )
                     total += count
         return total
 
-    def panel_embed(self, guild: discord.Guild) -> discord.Embed:
+    def panel_embed(self, guild: discord.Guild, database_name: str) -> discord.Embed:
         rows = activity_rows(guild)
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) AS count FROM public.discordbot_voice_sessions WHERE guild_id=%s",
-                    (guild.id,),
-                )
+                cur.execute("select count(*) as count from public.discordbot_voice_sessions where guild_id=%s", (guild.id,))
                 sessions = int(cur.fetchone()["count"])
-        embed = discord.Embed(title="🎙️ 음성 활동 관리 패널", color=0x5865F2)
+        embed = discord.Embed(title="🎙️ 음성 활동 관리 패널", color=0x57F287)
+        embed.description = "✅ **Supabase DB 연결 정상**"
+        embed.add_field(name="프로젝트", value="kokiriko", inline=True)
+        embed.add_field(name="데이터베이스", value=database_name, inline=True)
         embed.add_field(name="추적 멤버", value=f"{len(rows)}명", inline=True)
         embed.add_field(name="7일 이상 미접속", value=f"{sum(r['inactive_seconds'] >= 604800 for r in rows)}명", inline=True)
         embed.add_field(name="경고 보유", value=f"{sum(r['warnings'] > 0 for r in rows)}명", inline=True)
         embed.add_field(name="완료된 세션", value=f"{sessions:,}건", inline=True)
-        embed.set_footer(text="저장소: Supabase kokiriko · 기준일: 2026-07-01")
+        embed.set_footer(text=f"연결 확인: {now().strftime('%Y-%m-%d %H:%M:%S')} KST")
         return embed
 
     def member_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -327,139 +276,70 @@ class VoiceAuditCog(commands.Cog):
             f"{r['member'].mention} · 미접속 **{duration_text(r['inactive_seconds'])}** · 경고 **{r['warnings']}회**"
             for r in rows[:40]
         ) or "표시할 멤버가 없습니다."
-        if len(rows) > 40:
-            embed.set_footer(text=f"40명 표시 · 전체 {len(rows)}명은 Excel에서 확인")
-        return embed
-
-    def warning_embed(self, guild: discord.Guild) -> discord.Embed:
-        rows = [row for row in activity_rows(guild) if row["warnings"] > 0]
-        embed = discord.Embed(title="⚠️ 누적 경고 현황", color=0xED4245)
-        embed.description = "\n".join(
-            f"{r['member'].mention} · 경고 **{r['warnings']}회** · 미접속 {duration_text(r['inactive_seconds'])}"
-            for r in rows[:40]
-        ) or "경고 보유 멤버가 없습니다."
         return embed
 
     def recent_embed(self, guild: discord.Guild) -> discord.Embed:
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM public.discordbot_voice_sessions
-                    WHERE guild_id=%s ORDER BY id DESC LIMIT 20
-                    """,
-                    (guild.id,),
-                )
-                rows = list(cur.fetchall())
+                cur.execute("select * from public.discordbot_voice_sessions where guild_id=%s order by id desc limit 20", (guild.id,))
+                rows = cur.fetchall()
         embed = discord.Embed(title="🎙️ 최근 음성채널 입퇴장 기록", color=0x57F287)
         embed.description = "\n".join(
-            f"<@{r['user_id']}> · **{r['channel_name']}** · {duration_text(r['duration_seconds'])} · "
-            f"{parse_time(r['joined_at']).astimezone(KST).strftime('%m-%d %H:%M')} → "
-            f"{parse_time(r['left_at']).astimezone(KST).strftime('%H:%M')}"
+            f"<@{r['user_id']}> · **{r['channel_name']}** · {duration_text(r['duration_seconds'])}"
             for r in rows
         ) or "기록된 세션이 없습니다."
         return embed
 
     def make_excel(self, guild: discord.Guild) -> discord.File:
         book = Workbook()
-        fill = PatternFill("solid", fgColor="5865F2")
-        font = Font(color="FFFFFF", bold=True)
-
-        sessions_sheet = book.active
-        sessions_sheet.title = "음성 입퇴장 기록"
-        sessions_sheet.append(["유저 ID", "닉네임", "채널 ID", "채널명", "입장", "퇴장", "사용 시간(분)"])
+        sheet = book.active
+        sheet.title = "음성 입퇴장 기록"
+        sheet.append(["유저 ID","닉네임","채널명","입장","퇴장","사용 시간(분)"])
         with db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM public.discordbot_voice_sessions
-                    WHERE guild_id=%s ORDER BY joined_at DESC
-                    """,
-                    (guild.id,),
-                )
-                sessions = list(cur.fetchall())
-                for row in sessions:
-                    sessions_sheet.append([
-                        row["user_id"],
-                        row["display_name"],
-                        row["channel_id"],
-                        row["channel_name"],
-                        parse_time(row["joined_at"]).astimezone(KST).isoformat(),
-                        parse_time(row["left_at"]).astimezone(KST).isoformat(),
-                        round(row["duration_seconds"] / 60, 1),
-                    ])
-
-                cur.execute(
-                    """
-                    SELECT * FROM public.discordbot_warning_history
-                    WHERE guild_id=%s ORDER BY awarded_at DESC
-                    """,
-                    (guild.id,),
-                )
-                warning_rows = list(cur.fetchall())
-
-        status_sheet = book.create_sheet("멤버 미접속 및 경고")
-        status_sheet.append(["유저 ID", "닉네임", "최근 음성 접속", "미접속 시간", "미접속 일수", "누적 경고"])
-        for row in activity_rows(guild):
-            status_sheet.append([
-                row["member"].id,
-                row["member"].display_name,
-                row["last_voice"].isoformat() if row["last_voice"] else "기능 도입 후 접속 기록 없음",
-                duration_text(row["inactive_seconds"]),
-                round(row["inactive_seconds"] / 86400, 2),
-                row["warnings"],
-            ])
-
-        warning_sheet = book.create_sheet("경고 이력")
-        warning_sheet.append(["유저 ID", "닉네임", "경고 부여 시각", "기준 일수", "사유"])
-        for row in warning_rows:
-            warning_sheet.append([
-                row["user_id"],
-                row["display_name"],
-                parse_time(row["awarded_at"]).astimezone(KST).isoformat(),
-                row["inactivity_days"],
-                row["reason"],
-            ])
-
-        for sheet in book.worksheets:
-            sheet.freeze_panes = "A2"
-            for cell in sheet[1]:
-                cell.fill, cell.font = fill, font
-            for column in sheet.columns:
-                width = min(max(len(str(cell.value or "")) for cell in column) + 2, 45)
-                sheet.column_dimensions[column[0].column_letter].width = width
-
+                cur.execute("select * from public.discordbot_voice_sessions where guild_id=%s order by joined_at desc", (guild.id,))
+                for row in cur.fetchall():
+                    sheet.append([row["user_id"],row["display_name"],row["channel_name"],str(row["joined_at"]),str(row["left_at"]),round(row["duration_seconds"]/60,1)])
         output = io.BytesIO()
         book.save(output)
         output.seek(0)
-        return discord.File(output, filename=f"voice_audit_{guild.id}_{now().strftime('%Y%m%d_%H%M')}.xlsx")
+        return discord.File(output, filename=f"voice_audit_{now().strftime('%Y%m%d_%H%M')}.xlsx")
 
-    @app_commands.command(name="음성관리패널", description="[전용 관리자] 음성 기록 및 경고 관리 패널을 엽니다.")
-    async def panel(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(name="음성관리패널", description="[전용 관리자] 음성 기록 및 DB 연결 상태를 확인합니다.")
+    async def panel(self, interaction: discord.Interaction):
         if not authorized(interaction):
             await deny(interaction)
             return
-        await interaction.response.send_message(
-            embed=self.panel_embed(interaction.guild),
-            view=VoiceAuditView(self),
-            ephemeral=True,
-        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            database_name = await asyncio.to_thread(verify_database)
+            embed = await asyncio.to_thread(self.panel_embed, interaction.guild, database_name)
+            await interaction.followup.send(embed=embed, view=VoiceAuditView(self), ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
-    @app_commands.command(name="음성기록엑셀", description="[전용 관리자] 음성 기록과 경고 기록을 Excel로 출력합니다.")
-    async def export_excel(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(name="음성기록엑셀", description="[전용 관리자] 음성 기록을 Excel로 출력합니다.")
+    async def export_excel(self, interaction: discord.Interaction):
         if not authorized(interaction):
             await deny(interaction)
             return
         await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(file=self.make_excel(interaction.guild), ephemeral=True)
+        try:
+            file = await asyncio.to_thread(self.make_excel, interaction.guild)
+            await interaction.followup.send(file=file, ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
 
     @tasks.loop(hours=1)
-    async def warning_loop(self) -> None:
+    async def warning_loop(self):
         for guild in self.bot.guilds:
-            await self.check_warnings(guild)
+            try:
+                await asyncio.to_thread(self.check_warnings, guild)
+            except Exception:
+                pass
 
     @warning_loop.before_loop
-    async def before_warning_loop(self) -> None:
+    async def before_warning_loop(self):
         await self.bot.wait_until_ready()
 
 
