@@ -1,0 +1,24 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and local data
+*.log
+logs/
+data/
+
+# OS
+.DS_Store
+Thumbs.db
