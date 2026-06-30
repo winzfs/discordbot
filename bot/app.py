@@ -14,6 +14,7 @@ class DiscordBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = settings.message_content_intent
         intents.members = settings.members_intent
+        intents.voice_states = True
 
         super().__init__(
             command_prefix=commands.when_mentioned_or(settings.command_prefix),
@@ -21,19 +22,24 @@ class DiscordBot(commands.Bot):
             help_command=None,
         )
         self.settings = settings
+        self._commands_synced = False
 
     async def setup_hook(self) -> None:
         await self._load_extensions()
+        synced = await self.tree.sync()
+        self._commands_synced = True
+        logger.info("슬래시 명령어 동기화 완료: %s개", len(synced))
 
     async def on_ready(self) -> None:
         if self.user is None:
             return
 
         logger.info(
-            "봇 로그인 완료: %s (%s), 서버 %s개",
+            "봇 로그인 완료: %s (%s), 서버 %s개, 슬래시 동기화=%s",
             self.user,
             self.user.id,
             len(self.guilds),
+            self._commands_synced,
         )
 
     async def _load_extensions(self) -> None:
