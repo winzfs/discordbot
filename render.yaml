@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: discordbot
+    runtime: docker
+    repo: https://github.com/winzfs/discordbot
+    branch: main
+    dockerfilePath: ./Dockerfile
+    autoDeployTrigger: commit
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: COMMAND_PREFIX
+        value: "!"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: MESSAGE_CONTENT_INTENT
+        value: "true"
+      - key: MEMBERS_INTENT
+        value: "false"
