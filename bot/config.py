@@ -10,7 +10,7 @@ class Settings:
     command_prefix: str = "!"
     log_level: str = "INFO"
     message_content_intent: bool = True
-    members_intent: bool = False
+    members_intent: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -20,7 +20,7 @@ class Settings:
         if not token:
             raise RuntimeError(
                 "DISCORD_TOKEN이 설정되지 않았습니다. "
-                ".env.example을 참고해 .env 파일을 만들어 주세요."
+                ".env.example을 참고해 환경변수를 설정해 주세요."
             )
 
         return cls(
@@ -30,7 +30,7 @@ class Settings:
             message_content_intent=_to_bool(
                 os.getenv("MESSAGE_CONTENT_INTENT"), default=True
             ),
-            members_intent=_to_bool(os.getenv("MEMBERS_INTENT"), default=False),
+            members_intent=_to_bool(os.getenv("MEMBERS_INTENT"), default=True),
         )
 
 
