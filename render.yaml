@@ -16,4 +16,4 @@ services:
       - key: MESSAGE_CONTENT_INTENT
         value: "true"
       - key: MEMBERS_INTENT
-        value: "false"
+        value: "true"
