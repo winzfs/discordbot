@@ -22,34 +22,30 @@ class DiscordBot(commands.Bot):
             help_command=None,
         )
         self.settings = settings
-        self._commands_synced = False
         self._guild_commands_synced = False
 
     async def setup_hook(self) -> None:
         await self._load_extensions()
-        synced = await self.tree.sync()
-        self._commands_synced = True
-        logger.info("전역 슬래시 명령어 동기화 완료: %s개", len(synced))
+        logger.info("확장 모듈 로드 완료, 길드 전용 명령어 동기화 대기")
 
     async def on_ready(self) -> None:
         if self.user is None:
             return
 
         if not self._guild_commands_synced:
-            await self._sync_current_commands_to_guilds()
+            await self._sync_guild_only_commands()
             self._guild_commands_synced = True
 
         logger.info(
-            "봇 로그인 완료: %s (%s), 서버 %s개, 전역 동기화=%s, 길드 동기화=%s",
+            "봇 로그인 완료: %s (%s), 서버 %s개, 길드 명령어 동기화=%s",
             self.user,
             self.user.id,
             len(self.guilds),
-            self._commands_synced,
             self._guild_commands_synced,
         )
 
-    async def _sync_current_commands_to_guilds(self) -> None:
-        """예전 길드 명령어를 지우고 현재 명령어를 각 서버에 즉시 동기화한다."""
+    async def _sync_guild_only_commands(self) -> None:
+        """현재 명령어를 각 서버에 즉시 등록하고 전역 명령어는 제거한다."""
         for guild in self.guilds:
             guild_object = discord.Object(id=guild.id)
             try:
@@ -65,6 +61,14 @@ class DiscordBot(commands.Bot):
                     guild.id,
                     len(synced),
                 )
+
+        try:
+            self.tree.clear_commands(guild=None)
+            removed = await self.tree.sync()
+        except discord.HTTPException:
+            logger.exception("전역 명령어 제거 실패")
+        else:
+            logger.info("전역 명령어 제거 완료: 원격 전역 명령어 %s개", len(removed))
 
     async def _load_extensions(self) -> None:
         cogs_dir = Path(__file__).parent / "cogs"
