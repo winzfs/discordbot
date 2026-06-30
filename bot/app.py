@@ -23,7 +23,7 @@ class DiscordBot(commands.Bot):
         )
         self.settings = settings
         self._commands_synced = False
-        self._legacy_guild_commands_cleared = False
+        self._guild_commands_synced = False
 
     async def setup_hook(self) -> None:
         await self._load_extensions()
@@ -35,29 +35,36 @@ class DiscordBot(commands.Bot):
         if self.user is None:
             return
 
-        if not self._legacy_guild_commands_cleared:
-            await self._clear_legacy_guild_commands()
-            self._legacy_guild_commands_cleared = True
+        if not self._guild_commands_synced:
+            await self._sync_current_commands_to_guilds()
+            self._guild_commands_synced = True
 
         logger.info(
-            "봇 로그인 완료: %s (%s), 서버 %s개, 슬래시 동기화=%s",
+            "봇 로그인 완료: %s (%s), 서버 %s개, 전역 동기화=%s, 길드 동기화=%s",
             self.user,
             self.user.id,
             len(self.guilds),
             self._commands_synced,
+            self._guild_commands_synced,
         )
 
-    async def _clear_legacy_guild_commands(self) -> None:
-        """모든 서버에 남아 있는 예전 길드 전용 슬래시 명령어를 제거한다."""
+    async def _sync_current_commands_to_guilds(self) -> None:
+        """예전 길드 명령어를 지우고 현재 명령어를 각 서버에 즉시 동기화한다."""
         for guild in self.guilds:
             guild_object = discord.Object(id=guild.id)
             try:
                 self.tree.clear_commands(guild=guild_object)
-                await self.tree.sync(guild=guild_object)
+                self.tree.copy_global_to(guild=guild_object)
+                synced = await self.tree.sync(guild=guild_object)
             except discord.HTTPException:
-                logger.exception("길드 전용 명령어 정리 실패: %s (%s)", guild.name, guild.id)
+                logger.exception("길드 명령어 동기화 실패: %s (%s)", guild.name, guild.id)
             else:
-                logger.info("길드 전용 명령어 정리 완료: %s (%s)", guild.name, guild.id)
+                logger.info(
+                    "길드 명령어 동기화 완료: %s (%s), %s개",
+                    guild.name,
+                    guild.id,
+                    len(synced),
+                )
 
     async def _load_extensions(self) -> None:
         cogs_dir = Path(__file__).parent / "cogs"
