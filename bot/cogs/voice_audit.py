@@ -1,4 +1,4 @@
-"""음성채널 기록, 미접속 경고, 관리자 전용 임베드 및 Excel 출력."""
+"""음성채널 기록, 7일 미접속 경고, 관리자 전용 패널과 Excel 출력."""
 from __future__ import annotations
 
 import datetime as dt
@@ -18,6 +18,7 @@ ADMIN_USER_ID = 324558739921305602
 WARNING_DAYS = 7
 KST = ZoneInfo("Asia/Seoul")
 DB_PATH = Path("voice_audit.db")
+MIGRATION_KEY = "baseline_from_feature_start_v2"
 
 
 def now() -> dt.datetime:
@@ -31,6 +32,7 @@ def db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    current = now().isoformat()
     with db() as conn:
         conn.executescript(
             """
@@ -64,8 +66,28 @@ def init_db() -> None:
                 inactivity_days INTEGER NOT NULL,
                 reason TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS voice_audit_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
+        migrated = conn.execute(
+            "SELECT 1 FROM voice_audit_meta WHERE key=?", (MIGRATION_KEY,)
+        ).fetchone()
+        if not migrated:
+            conn.execute(
+                """
+                UPDATE member_activity
+                SET baseline_at=?, last_warning_at=NULL, warning_count=0
+                """,
+                (current,),
+            )
+            conn.execute("DELETE FROM warning_history")
+            conn.execute(
+                "INSERT INTO voice_audit_meta(key,value) VALUES(?,?)",
+                (MIGRATION_KEY, current),
+            )
 
 
 def parse_time(value: str | None) -> dt.datetime | None:
@@ -91,7 +113,6 @@ def duration_text(seconds: int) -> str:
 def ensure_member(member: discord.Member) -> None:
     if member.bot:
         return
-    baseline = member.joined_at.astimezone(KST) if member.joined_at else now()
     with db() as conn:
         conn.execute(
             """
@@ -100,12 +121,14 @@ def ensure_member(member: discord.Member) -> None:
             ON CONFLICT(guild_id,user_id)
             DO UPDATE SET display_name=excluded.display_name
             """,
-            (member.guild.id, member.id, member.display_name, baseline.isoformat()),
+            (member.guild.id, member.id, member.display_name, now().isoformat()),
         )
 
 
 def activity_rows(guild: discord.Guild) -> list[dict]:
     current = now()
+    for member in guild.members:
+        ensure_member(member)
     with db() as conn:
         saved = {
             row["user_id"]: row
@@ -115,12 +138,10 @@ def activity_rows(guild: discord.Guild) -> list[dict]:
     for member in guild.members:
         if member.bot:
             continue
-        ensure_member(member)
         row = saved.get(member.id)
-        baseline = parse_time(row["baseline_at"]) if row else None
-        baseline = baseline or (member.joined_at.astimezone(KST) if member.joined_at else current)
+        baseline = parse_time(row["baseline_at"]) if row else current
         last_voice = parse_time(row["last_voice_at"]) if row else None
-        reference = last_voice or baseline
+        reference = last_voice or baseline or current
         rows.append({
             "member": member,
             "last_voice": last_voice,
@@ -130,16 +151,16 @@ def activity_rows(guild: discord.Guild) -> list[dict]:
     return sorted(rows, key=lambda item: item["inactive_seconds"], reverse=True)
 
 
-async def deny(interaction: discord.Interaction) -> None:
-    message = "이 기능은 지정된 관리자만 사용할 수 있습니다."
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-
-
-def is_authorized(interaction: discord.Interaction) -> bool:
+def authorized(interaction: discord.Interaction) -> bool:
     return interaction.user.id == ADMIN_USER_ID
+
+
+async def deny(interaction: discord.Interaction) -> None:
+    text = "이 기능은 지정된 관리자만 사용할 수 있습니다."
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
 
 
 class VoiceAuditView(discord.ui.View):
@@ -148,7 +169,7 @@ class VoiceAuditView(discord.ui.View):
         self.cog = cog
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if is_authorized(interaction):
+        if authorized(interaction):
             return True
         await deny(interaction)
         return False
@@ -261,18 +282,17 @@ class VoiceAuditCog(commands.Cog):
                 conn.execute(
                     """
                     UPDATE member_activity
-                    SET display_name=?,warning_count=warning_count+?,last_warning_at=?
+                    SET warning_count=warning_count+?,last_warning_at=?
                     WHERE guild_id=? AND user_id=?
                     """,
-                    (member.display_name, count, warning_time.isoformat(), guild.id, member.id),
+                    (count, warning_time.isoformat(), guild.id, member.id),
                 )
                 for index in range(count):
                     awarded = reference + dt.timedelta(days=WARNING_DAYS * (index + 1))
                     conn.execute(
                         """
-                        INSERT INTO warning_history(
-                            guild_id,user_id,display_name,awarded_at,inactivity_days,reason
-                        ) VALUES(?,?,?,?,?,?)
+                        INSERT INTO warning_history(guild_id,user_id,display_name,awarded_at,inactivity_days,reason)
+                        VALUES(?,?,?,?,?,?)
                         """,
                         (guild.id, member.id, member.display_name, awarded.isoformat(), WARNING_DAYS,
                          "음성채널 7일 미접속"),
@@ -289,7 +309,7 @@ class VoiceAuditCog(commands.Cog):
         embed.add_field(name="7일 이상 미접속", value=f"{sum(r['inactive_seconds'] >= 604800 for r in rows)}명", inline=True)
         embed.add_field(name="경고 보유", value=f"{sum(r['warnings'] > 0 for r in rows)}명", inline=True)
         embed.add_field(name="완료된 세션", value=f"{sessions:,}건", inline=True)
-        embed.set_footer(text="사용 권한: 지정 관리자 1명")
+        embed.set_footer(text="미접속 기간은 기능 도입 시점부터 계산됩니다.")
         return embed
 
     def member_embed(self, guild: discord.Guild) -> discord.Embed:
@@ -330,15 +350,15 @@ class VoiceAuditCog(commands.Cog):
         fill = PatternFill("solid", fgColor="5865F2")
         font = Font(color="FFFFFF", bold=True)
 
-        session_sheet = book.active
-        session_sheet.title = "음성 입퇴장 기록"
-        session_sheet.append(["유저 ID", "닉네임", "채널 ID", "채널명", "입장", "퇴장", "사용 시간(분)"])
+        sessions_sheet = book.active
+        sessions_sheet.title = "음성 입퇴장 기록"
+        sessions_sheet.append(["유저 ID", "닉네임", "채널 ID", "채널명", "입장", "퇴장", "사용 시간(분)"])
         with db() as conn:
             sessions = conn.execute(
                 "SELECT * FROM voice_sessions WHERE guild_id=? ORDER BY joined_at DESC", (guild.id,)
             ).fetchall()
             for row in sessions:
-                session_sheet.append([
+                sessions_sheet.append([
                     row["user_id"], row["display_name"], row["channel_id"], row["channel_name"],
                     row["joined_at"], row["left_at"], round(row["duration_seconds"] / 60, 1),
                 ])
@@ -348,7 +368,7 @@ class VoiceAuditCog(commands.Cog):
         for row in activity_rows(guild):
             status_sheet.append([
                 row["member"].id, row["member"].display_name,
-                row["last_voice"].isoformat() if row["last_voice"] else "접속 기록 없음",
+                row["last_voice"].isoformat() if row["last_voice"] else "기능 도입 후 접속 기록 없음",
                 duration_text(row["inactive_seconds"]), round(row["inactive_seconds"] / 86400, 2), row["warnings"],
             ])
 
@@ -378,7 +398,7 @@ class VoiceAuditCog(commands.Cog):
 
     @app_commands.command(name="음성관리패널", description="[전용 관리자] 음성 기록 및 경고 관리 패널을 엽니다.")
     async def panel(self, interaction: discord.Interaction) -> None:
-        if not is_authorized(interaction):
+        if not authorized(interaction):
             await deny(interaction)
             return
         await interaction.response.send_message(
@@ -387,7 +407,7 @@ class VoiceAuditCog(commands.Cog):
 
     @app_commands.command(name="음성기록엑셀", description="[전용 관리자] 음성 기록과 경고 기록을 Excel로 출력합니다.")
     async def export_excel(self, interaction: discord.Interaction) -> None:
-        if not is_authorized(interaction):
+        if not authorized(interaction):
             await deny(interaction)
             return
         await interaction.response.defer(ephemeral=True)
