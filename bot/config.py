@@ -30,7 +30,8 @@ class Settings:
             message_content_intent=_to_bool(
                 os.getenv("MESSAGE_CONTENT_INTENT"), default=True
             ),
-            members_intent=_to_bool(os.getenv("MEMBERS_INTENT"), default=True),
+            # 전체 멤버 음성 미접속 추적에 필수이므로 환경변수로 끌 수 없게 고정한다.
+            members_intent=True,
         )
 
 
