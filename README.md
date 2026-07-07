@@ -2,6 +2,8 @@
 
 유지보수와 기능 확장을 쉽게 하기 위한 Python 기반 Discord 봇입니다.
 
+> Deploy marker: voice-panel-channel-select-2026-07-07-2117
+
 ## 구조
 
 ```text
@@ -78,11 +80,5 @@ class Example(commands.Cog):
 
     @commands.command(name="예제")
     async def example(self, ctx: commands.Context) -> None:
-        await ctx.send("새 기능입니다.")
-
-
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Example(bot))
+        await ctx.send("예제 명령어입니다.")
 ```
-
-파일명 앞에 `_`를 붙이면 자동 로딩에서 제외됩니다.
