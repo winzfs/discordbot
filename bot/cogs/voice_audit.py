@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 ADMIN_USER_ID = 324558739921305602
 WARNING_DAYS = 7
 KST = ZoneInfo("Asia/Seoul")
+FEATURE_BASELINE = dt.datetime(2026, 7, 1, 0, 0, tzinfo=KST)
+FIRST_REPORT_AT = dt.datetime(2026, 7, 8, 10, 0, tzinfo=KST)
 DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 
 
@@ -42,7 +44,16 @@ def parse_time(value):
     if value is None:
         return None
     parsed = value if isinstance(value, dt.datetime) else dt.datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=KST)
+    return parsed.astimezone(KST) if parsed.tzinfo else parsed.replace(tzinfo=KST)
+
+
+def member_joined_at(member: discord.Member) -> dt.datetime:
+    joined = member.joined_at or now()
+    return parse_time(joined)
+
+
+def tracking_baseline(member: discord.Member) -> dt.datetime:
+    return max(FEATURE_BASELINE, member_joined_at(member))
 
 
 def duration_text(seconds: int) -> str:
@@ -68,7 +79,7 @@ def verify_database() -> str:
 def upsert_members(guild_id: int, members: list[discord.Member]) -> None:
     current = now()
     rows = [
-        (guild_id, member.id, member.display_name, current, current)
+        (guild_id, member.id, member.display_name, tracking_baseline(member), member_joined_at(member), current)
         for member in members
         if not member.bot
     ]
@@ -79,10 +90,14 @@ def upsert_members(guild_id: int, members: list[discord.Member]) -> None:
             cur.executemany(
                 """
                 insert into public.discordbot_member_activity
-                (guild_id,user_id,display_name,baseline_at,updated_at)
-                values(%s,%s,%s,%s,%s)
+                (guild_id,user_id,display_name,baseline_at,joined_at,updated_at)
+                values(%s,%s,%s,%s,%s,%s)
                 on conflict(guild_id,user_id)
-                do update set display_name=excluded.display_name,updated_at=excluded.updated_at
+                do update set
+                  display_name=excluded.display_name,
+                  baseline_at=excluded.baseline_at,
+                  joined_at=excluded.joined_at,
+                  updated_at=excluded.updated_at
                 """,
                 rows,
             )
@@ -107,7 +122,7 @@ def build_activity_rows(guild_id: int, members: list[discord.Member]) -> list[di
         if member.bot:
             continue
         row = saved.get(member.id)
-        baseline = parse_time(row["baseline_at"]) if row else current
+        baseline = parse_time(row["baseline_at"]) if row else tracking_baseline(member)
         last_voice = parse_time(row["last_voice_at"]) if row else None
         reference = last_voice or baseline or current
         rows.append({
@@ -115,6 +130,7 @@ def build_activity_rows(guild_id: int, members: list[discord.Member]) -> list[di
             "last_voice": last_voice,
             "inactive_seconds": max(0, int((current - reference).total_seconds())),
             "warnings": int(row["warning_count"]) if row else 0,
+            "joined_at": member_joined_at(member),
         })
     return sorted(rows, key=lambda item: item["inactive_seconds"], reverse=True)
 
@@ -185,8 +201,8 @@ class VoiceAuditView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             members = await self.cog.fetch_all_members(interaction.guild)
-            count = await asyncio.to_thread(self.cog.check_warnings, interaction.guild, members)
-            await interaction.followup.send(f"새 경고 **{count}회**를 부여했습니다.", ephemeral=True)
+            awarded = await asyncio.to_thread(self.cog.check_warnings, interaction.guild, members, 1)
+            await interaction.followup.send(f"새 경고 **{len(awarded)}명 / {sum(item['count'] for item in awarded)}회**를 부여했습니다.", ephemeral=True)
         except Exception as exc:
             await db_error(interaction, exc)
 
@@ -204,10 +220,10 @@ class VoiceAuditView(discord.ui.View):
 class VoiceAuditCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.warning_loop.start()
+        self.weekly_report_loop.start()
 
     def cog_unload(self):
-        self.warning_loop.cancel()
+        self.weekly_report_loop.cancel()
 
     async def fetch_all_members(self, guild: discord.Guild) -> list[discord.Member]:
         if not self.bot.intents.members:
@@ -359,32 +375,38 @@ class VoiceAuditCog(commands.Cog):
                     (member.display_name,current,current,member.guild.id,member.id),
                 )
 
-    def check_warnings(self, guild: discord.Guild, members: list[discord.Member]) -> int:
+    def check_warnings(self, guild: discord.Guild, members: list[discord.Member], max_per_member: int = 1) -> list[dict]:
         upsert_members(guild.id, members)
         current = now()
-        names = {member.id: member.display_name for member in members}
-        total = 0
+        member_map = {member.id: member for member in members}
+        awarded: list[dict] = []
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("select pg_try_advisory_xact_lock(%s) as locked", (guild.id,))
                 if not cur.fetchone()["locked"]:
-                    return 0
+                    return []
                 cur.execute(
                     "select * from public.discordbot_member_activity where guild_id=%s for update",
                     (guild.id,),
                 )
                 for row in cur.fetchall():
                     user_id = int(row["user_id"])
-                    if user_id not in names:
+                    member = member_map.get(user_id)
+                    if member is None:
                         continue
-                    baseline = parse_time(row["baseline_at"]) or current
+                    joined_at = member_joined_at(member)
+                    if (current - joined_at).total_seconds() < WARNING_DAYS * 86400:
+                        continue
+                    baseline = parse_time(row["baseline_at"]) or tracking_baseline(member)
                     last_voice = parse_time(row["last_voice_at"])
                     last_warning = parse_time(row["last_warning_at"])
                     reference = max(value for value in (baseline,last_voice,last_warning) if value)
                     count = math.floor((current-reference).total_seconds()/(WARNING_DAYS*86400))
+                    count = min(count, max_per_member)
                     if count <= 0:
                         continue
                     warning_time = reference + dt.timedelta(days=WARNING_DAYS*count)
+                    new_total = int(row["warning_count"]) + count
                     cur.execute(
                         """
                         update public.discordbot_member_activity
@@ -401,10 +423,106 @@ class VoiceAuditCog(commands.Cog):
                             (guild_id,user_id,display_name,awarded_at,inactivity_days,reason)
                             values(%s,%s,%s,%s,%s,%s)
                             """,
-                            (guild.id,user_id,names[user_id],awarded_at,WARNING_DAYS,"음성채널 7일 미접속"),
+                            (guild.id,user_id,member.display_name,awarded_at,WARNING_DAYS,"음성채널 7일 미접속"),
                         )
-                    total += count
-        return total
+                    awarded.append({"member": member, "count": count, "total": new_total})
+        return awarded
+
+    def get_report_channel_id(self, guild_id: int) -> int | None:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select channel_id from public.discordbot_voice_report_config where guild_id=%s", (guild_id,))
+                row = cur.fetchone()
+                return int(row["channel_id"]) if row and row["channel_id"] else None
+
+    def set_report_channel_id(self, guild_id: int, channel_id: int) -> None:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.discordbot_voice_report_config(guild_id,channel_id,updated_at)
+                    values(%s,%s,%s)
+                    on conflict(guild_id)
+                    do update set channel_id=excluded.channel_id,updated_at=excluded.updated_at
+                    """,
+                    (guild_id,channel_id,now()),
+                )
+
+    def reserve_report(self, guild_id: int, report_key: str, week: int) -> bool:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into public.discordbot_voice_audit_report_log
+                    (guild_id,report_key,report_week,reported_at,warning_member_count)
+                    values(%s,%s,%s,%s,0)
+                    on conflict(guild_id,report_key) do nothing
+                    """,
+                    (guild_id,report_key,week,now()),
+                )
+                return cur.rowcount == 1
+
+    def finish_report(self, guild_id: int, report_key: str, channel_id: int, warning_member_count: int) -> None:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update public.discordbot_voice_audit_report_log
+                    set recipient_channel_id=%s,warning_member_count=%s,reported_at=%s
+                    where guild_id=%s and report_key=%s
+                    """,
+                    (channel_id,warning_member_count,now(),guild_id,report_key),
+                )
+
+    def build_report_embeds(self, guild: discord.Guild, week: int, awarded: list[dict]) -> list[discord.Embed]:
+        report_date = now().strftime("%Y-%m-%d %H:%M")
+        title = f"⚠️ 음성 미접속 경고자 명단 · {week}주차"
+        if not awarded:
+            embed = discord.Embed(title=title, color=0x57F287)
+            embed.description = "이번 주 새로 경고가 부여된 멤버가 없습니다."
+            embed.set_footer(text=f"기준: 7일 이상 음성채널 미접속 · {report_date} KST")
+            return [embed]
+        lines = [
+            f"{idx}. {item['member'].mention} · **{item['member'].display_name}** · 누적 경고 **{item['total']}회**"
+            for idx, item in enumerate(awarded, start=1)
+        ]
+        chunks: list[list[str]] = []
+        chunk: list[str] = []
+        length = 0
+        for line in lines:
+            if chunk and length + len(line) + 1 > 3800:
+                chunks.append(chunk)
+                chunk = []
+                length = 0
+            chunk.append(line)
+            length += len(line) + 1
+        if chunk:
+            chunks.append(chunk)
+        embeds = []
+        for page, chunk_lines in enumerate(chunks, start=1):
+            embed = discord.Embed(title=title, color=0xED4245)
+            embed.description = "\n".join(chunk_lines)
+            embed.add_field(name="이번 주 신규 경고", value=f"{len(awarded)}명", inline=True)
+            embed.add_field(name="기준", value="7일 이상 음성채널 미접속", inline=True)
+            embed.set_footer(text=f"{page}/{len(chunks)} · {report_date} KST")
+            embeds.append(embed)
+        return embeds
+
+    async def send_weekly_report(self, guild: discord.Guild, report_key: str, week: int) -> None:
+        channel_id = await asyncio.to_thread(self.get_report_channel_id, guild.id)
+        if channel_id is None:
+            logger.warning("음성 경고 보고 채널 미설정: guild=%s", guild.id)
+            return
+        channel = guild.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            logger.warning("음성 경고 보고 채널이 텍스트 채널이 아님: guild=%s channel=%s", guild.id, channel_id)
+            return
+        members = await self.fetch_all_members(guild)
+        awarded = await asyncio.to_thread(self.check_warnings, guild, members, 1)
+        embeds = self.build_report_embeds(guild, week, awarded)
+        for embed in embeds:
+            await channel.send(embed=embed)
+        await asyncio.to_thread(self.finish_report, guild.id, report_key, channel_id, len(awarded))
 
     def panel_embed(self, guild: discord.Guild, members: list[discord.Member], database_name: str) -> discord.Embed:
         rows = build_activity_rows(guild.id, members)
@@ -414,11 +532,15 @@ class VoiceAuditCog(commands.Cog):
                 sessions = int(cur.fetchone()["count"])
                 cur.execute("select count(*) as count from public.discordbot_active_voice_sessions where guild_id=%s", (guild.id,))
                 active = int(cur.fetchone()["count"])
+                cur.execute("select channel_id from public.discordbot_voice_report_config where guild_id=%s", (guild.id,))
+                report_row = cur.fetchone()
+        report_channel = f"<#{report_row['channel_id']}>" if report_row and report_row["channel_id"] else "미설정"
         embed = discord.Embed(title="🎙️ 음성 활동 관리 패널", color=0x57F287)
         embed.description = "✅ **Supabase DB 연결 정상**\n✅ **전체 멤버 목록 불러오기 정상**"
         embed.add_field(name="프로젝트", value="kokiriko", inline=True)
         embed.add_field(name="전체 멤버", value=f"{len(members)}명", inline=True)
         embed.add_field(name="현재 음성 접속", value=f"{active}명", inline=True)
+        embed.add_field(name="경고 공지 채널", value=report_channel, inline=True)
         embed.add_field(name="7일 이상 미접속", value=f"{sum(r['inactive_seconds'] >= 604800 for r in rows)}명", inline=True)
         embed.add_field(name="경고 보유", value=f"{sum(r['warnings'] > 0 for r in rows)}명", inline=True)
         embed.add_field(name="완료된 세션", value=f"{sessions:,}건", inline=True)
@@ -465,11 +587,12 @@ class VoiceAuditCog(commands.Cog):
         book = Workbook()
         status_sheet = book.active
         status_sheet.title = "전체 멤버 미접속 및 경고"
-        status_sheet.append(["유저 ID","닉네임","최근 음성 접속","미접속 시간","미접속 일수","누적 경고"])
+        status_sheet.append(["유저 ID","닉네임","가입일","최근 음성 접속","미접속 시간","미접속 일수","누적 경고"])
         for row in activity:
             status_sheet.append([
                 row["member"].id,
                 row["member"].display_name,
+                str(row["joined_at"]),
                 str(row["last_voice"] or "기능 적용 후 접속 기록 없음"),
                 duration_text(row["inactive_seconds"]),
                 round(row["inactive_seconds"]/86400,2),
@@ -524,17 +647,41 @@ class VoiceAuditCog(commands.Cog):
         except Exception as exc:
             await db_error(interaction, exc)
 
-    @tasks.loop(hours=1)
-    async def warning_loop(self):
+    @app_commands.command(name="음성공지채널설정", description="[전용 관리자] 주간 음성 미접속 경고 명단을 보낼 채널을 설정합니다.")
+    @app_commands.describe(channel="경고자 명단을 보낼 공지 채널")
+    async def set_report_channel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        if not authorized(interaction):
+            await deny(interaction)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(self.set_report_channel_id, interaction.guild.id, channel.id)
+            await interaction.followup.send(f"✅ 음성 경고자 명단 공지 채널을 {channel.mention}(으)로 설정했습니다.", ephemeral=True)
+        except Exception as exc:
+            await db_error(interaction, exc)
+
+    @tasks.loop(minutes=5)
+    async def weekly_report_loop(self):
+        current = now()
+        if current < FIRST_REPORT_AT:
+            return
+        if current.weekday() != 2 or current.hour != 10:
+            return
+        week = ((current.date() - FEATURE_BASELINE.date()).days // 7)
+        if week < 1:
+            return
+        report_key = f"voice-warning-week-{week}-{current.date().isoformat()}"
         for guild in self.bot.guilds:
             try:
-                members = await self.fetch_all_members(guild)
-                await asyncio.to_thread(self.check_warnings, guild, members)
+                reserved = await asyncio.to_thread(self.reserve_report, guild.id, report_key, week)
+                if not reserved:
+                    continue
+                await self.send_weekly_report(guild, report_key, week)
             except Exception:
-                logger.exception("자동 경고 점검 실패: %s", guild.id)
+                logger.exception("주간 음성 경고 보고 실패: %s", guild.id)
 
-    @warning_loop.before_loop
-    async def before_warning_loop(self):
+    @weekly_report_loop.before_loop
+    async def before_weekly_report_loop(self):
         await self.bot.wait_until_ready()
 
 
