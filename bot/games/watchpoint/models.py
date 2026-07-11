@@ -60,6 +60,10 @@ class StageDef:
     def global_id(self) -> int:
         return (self.chapter - 1) * 10 + self.stage
 
+    @property
+    def mastery_xp(self) -> int:
+        return 40 + self.stage * 4 + self.chapter * 3
+
 
 @dataclass(frozen=True, slots=True)
 class ChapterDef:
