@@ -1,14 +1,17 @@
 """오버워치 파티 모집 시스템 Cog."""
 from __future__ import annotations
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot.recruiting.builder import RecruitBuilderView
-from bot.recruiting.render import panel_embed
 from bot.recruiting.store import RecruitStore
 from bot.recruiting.views import RecruitPanelView, RecruitPostView, refresh_panel
+
+logger = logging.getLogger(__name__)
 
 
 class RecruitCog(commands.Cog):
@@ -41,9 +44,9 @@ class RecruitCog(commands.Cog):
             return
 
         builder = RecruitBuilderView(self.bot, self.store, interaction)
-        await interaction.response.send_message(embed=builder.embed(), view=builder, ephemeral=True)
+        await interaction.response.send_message(view=builder, ephemeral=True)
 
-    @app_commands.command(name="모집", description="임베드 설정창에서 오버워치 파티원을 모집합니다.")
+    @app_commands.command(name="모집", description="설정창에서 오버워치 파티원을 모집합니다.")
     async def recruit(self, interaction: discord.Interaction) -> None:
         await self.open_builder(interaction)
 
@@ -59,8 +62,7 @@ class RecruitCog(commands.Cog):
 
         try:
             message = await interaction.channel.send(
-                embed=panel_embed(self.store, interaction.guild.id),
-                view=RecruitPanelView(self.bot, self.store),
+                view=RecruitPanelView(self.bot, self.store, interaction.guild.id),
             )
         except discord.HTTPException:
             await interaction.followup.send("패널 생성에 실패했습니다. 봇 권한을 확인해 주세요.", ephemeral=True)
@@ -71,7 +73,7 @@ class RecruitCog(commands.Cog):
             await message.pin(reason="오버워치 파티 모집 패널")
         except (discord.Forbidden, discord.HTTPException):
             pass
-        await interaction.followup.send("이 채널에 파티 모집 패널을 설치했습니다.", ephemeral=True)
+        await interaction.followup.send("이 채널에 Components V2 파티 모집 패널을 설치했습니다.", ephemeral=True)
 
     async def _delete_old_panel(self, guild_id: int) -> None:
         old_config = self.store.get_panel(guild_id)
@@ -85,6 +87,28 @@ class RecruitCog(commands.Cog):
             await old_message.delete()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
+    async def _migrate_existing_messages(self) -> None:
+        """배포 전에 생성된 Embed + View 메시지를 Components V2로 자동 변환한다."""
+        for guild_id in {int(value) for value in self.store.config.keys()}:
+            await refresh_panel(self.bot, self.store, guild_id)
+
+        for state in self.store.recruits.values():
+            if not self.store.is_live(state):
+                continue
+            channel = self.bot.get_channel(int(state.get("channel_id", 0)))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            try:
+                message = await channel.fetch_message(int(state.get("message_id", 0)))
+                await message.edit(
+                    content=None,
+                    embed=None,
+                    attachments=[],
+                    view=RecruitPostView(self.bot, self.store, state),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.warning("기존 모집 글 V2 변환 실패: message=%s", state.get("message_id"))
 
     @tasks.loop(minutes=1)
     async def cleanup_expired(self) -> None:
@@ -113,6 +137,7 @@ class RecruitCog(commands.Cog):
     @cleanup_expired.before_loop
     async def before_cleanup(self) -> None:
         await self.bot.wait_until_ready()
+        await self._migrate_existing_messages()
 
 
 async def setup(bot: commands.Bot) -> None:
