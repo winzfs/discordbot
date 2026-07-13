@@ -37,8 +37,15 @@ class RecruitCog(commands.Cog):
             await interaction.response.send_message("서버 안에서만 사용할 수 있습니다.", ephemeral=True)
             return
         if self.store.find_user_recruit(interaction.guild.id, interaction.user.id):
+            from bot.recruiting.manage import RecruitDashboardView
+
             await interaction.response.send_message(
-                "이미 참가 중인 모집이 있습니다. 기존 모집을 정리한 뒤 다시 시도해 주세요.",
+                view=RecruitDashboardView(
+                    self.bot,
+                    self.store,
+                    interaction.guild.id,
+                    interaction.user.id,
+                ),
                 ephemeral=True,
             )
             return
@@ -46,11 +53,11 @@ class RecruitCog(commands.Cog):
         builder = RecruitBuilderView(self.bot, self.store, interaction)
         await interaction.response.send_message(view=builder, ephemeral=True)
 
-    @app_commands.command(name="모집", description="설정창에서 오버워치 파티원을 모집합니다.")
+    @app_commands.command(name="모집", description="설정 화면에서 오버워치 파티원을 모집합니다.")
     async def recruit(self, interaction: discord.Interaction) -> None:
         await self.open_builder(interaction)
 
-    @app_commands.command(name="모집채널설정", description="[관리자] 현재 채널에 파티 모집 패널을 설치합니다.")
+    @app_commands.command(name="모집채널설정", description="[관리자] 현재 채널에 파티 모집 앱 패널을 설치합니다.")
     @app_commands.default_permissions(administrator=True)
     async def setup_panel(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
@@ -65,7 +72,15 @@ class RecruitCog(commands.Cog):
                 view=RecruitPanelView(self.bot, self.store, interaction.guild.id),
             )
         except discord.HTTPException:
-            await interaction.followup.send("패널 생성에 실패했습니다. 봇 권한을 확인해 주세요.", ephemeral=True)
+            from bot.recruiting.manage import RecruitNoticeView
+
+            await interaction.edit_original_response(
+                view=RecruitNoticeView(
+                    "패널을 설치하지 못했어요",
+                    "봇의 메시지 전송, 링크 첨부, 메시지 관리 권한을 확인해 주세요.",
+                    kind="danger",
+                )
+            )
             return
 
         self.store.set_panel(interaction.guild.id, interaction.channel.id, message.id)
@@ -73,7 +88,16 @@ class RecruitCog(commands.Cog):
             await message.pin(reason="오버워치 파티 모집 패널")
         except (discord.Forbidden, discord.HTTPException):
             pass
-        await interaction.followup.send("이 채널에 Components V2 파티 모집 패널을 설치했습니다.", ephemeral=True)
+
+        from bot.recruiting.manage import RecruitNoticeView
+
+        await interaction.edit_original_response(
+            view=RecruitNoticeView(
+                "파티 모집 앱을 설치했어요",
+                f"{interaction.channel.mention}에서 새 패널을 사용할 수 있습니다.",
+                kind="success",
+            )
+        )
 
     async def _delete_old_panel(self, guild_id: int) -> None:
         old_config = self.store.get_panel(guild_id)
@@ -89,7 +113,7 @@ class RecruitCog(commands.Cog):
             pass
 
     async def _migrate_existing_messages(self) -> None:
-        """배포 전에 생성된 Embed + View 메시지를 Components V2로 자동 변환한다."""
+        """배포 전에 생성된 모집 메시지를 최신 앱 레이아웃으로 자동 변환한다."""
         for guild_id in {int(value) for value in self.store.config.keys()}:
             await refresh_panel(self.bot, self.store, guild_id)
 
@@ -108,7 +132,7 @@ class RecruitCog(commands.Cog):
                     view=RecruitPostView(self.bot, self.store, state),
                 )
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                logger.warning("기존 모집 글 V2 변환 실패: message=%s", state.get("message_id"))
+                logger.warning("기존 모집 글 앱 UI 변환 실패: message=%s", state.get("message_id"))
 
     @tasks.loop(minutes=1)
     async def cleanup_expired(self) -> None:
