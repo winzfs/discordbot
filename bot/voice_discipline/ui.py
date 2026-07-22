@@ -1,7 +1,8 @@
-"""Discord UI for three-warning DM notices and soft-ban controls."""
+"""Discord UI for voice-warning management and three-warning soft-ban controls."""
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 
 import discord
@@ -11,6 +12,76 @@ from bot.voice_discipline import service, store
 
 logger = logging.getLogger(__name__)
 _GUILD_SOFTBAN_LOCKS: dict[int, asyncio.Lock] = {}
+_GUILD_REPORT_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def current_report_period() -> tuple[int, dt.datetime, dt.datetime]:
+    current = voice_audit.now()
+    week = max(0, (current.date() - voice_audit.FEATURE_BASELINE.date()).days // 7)
+    start = voice_audit.FEATURE_BASELINE + dt.timedelta(weeks=week)
+    end = start + dt.timedelta(days=7)
+    return week, start, end
+
+
+def load_week_awarded(
+    guild: discord.Guild,
+    members: list[discord.Member],
+    start: dt.datetime,
+    end: dt.datetime,
+) -> list[dict]:
+    member_map = {member.id: member for member in members}
+    saved = voice_audit.load_activity(guild.id)
+    with voice_audit.db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select user_id, max(display_name) as display_name, count(*) as warning_count
+            from public.discordbot_warning_history
+            where guild_id=%s and awarded_at >= %s and awarded_at < %s
+            group by user_id
+            order by max(awarded_at), user_id
+            """,
+            (guild.id, start, end),
+        )
+        rows = cur.fetchall()
+
+    awarded: list[dict] = []
+    for row in rows:
+        user_id = int(row["user_id"])
+        member = member_map.get(user_id)
+        if member is None:
+            continue
+        activity = saved.get(user_id)
+        total = int(activity["warning_count"] or 0) if activity else int(row["warning_count"] or 0)
+        awarded.append(
+            {
+                "member": member,
+                "count": int(row["warning_count"] or 0),
+                "total": total,
+            }
+        )
+    return awarded
+
+
+def recheck_embed(week: int, newly_awarded: list[dict], week_awarded: list[dict]) -> discord.Embed:
+    embed = discord.Embed(title=f"🔍 이번 주 경고 재확인 · {week}주차", color=0x57F287)
+    embed.description = (
+        f"재확인으로 새로 반영된 경고: **{len(newly_awarded)}명 / "
+        f"{sum(item['count'] for item in newly_awarded)}회**\n"
+        f"이번 주 전체 경고 대상: **{len(week_awarded)}명**"
+    )
+    if week_awarded:
+        embed.add_field(
+            name="이번 주 경고 명단",
+            value="\n".join(
+                f"{index}. {item['member'].mention} · 누적 **{item['total']}회**"
+                for index, item in enumerate(week_awarded[:25], start=1)
+            )[:1024],
+            inline=False,
+        )
+    else:
+        embed.add_field(name="이번 주 경고 명단", value="이번 주 새 경고 대상이 없습니다.", inline=False)
+    embed.set_footer(text="이미 반영된 기간은 중복 경고 없이 건너뜁니다.")
+    return embed
 
 
 def target_embeds(
@@ -226,6 +297,80 @@ class SoftbanConfirmView(discord.ui.View):
 
 
 class DisciplineVoiceAuditView(voice_audit_patch.EnhancedVoiceAuditView):
+    @discord.ui.button(label="이번 주 경고 재확인", emoji="🔄", style=discord.ButtonStyle.success, row=2)
+    async def recheck_week(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_lock = _GUILD_REPORT_LOCKS.setdefault(interaction.guild.id, asyncio.Lock())
+        if guild_lock.locked():
+            await interaction.followup.send("이 서버의 경고 점검 또는 공지 발송이 이미 진행 중입니다.", ephemeral=True)
+            return
+        try:
+            async with guild_lock:
+                members = await self.cog.fetch_all_members(interaction.guild)
+                newly_awarded = await asyncio.to_thread(
+                    self.cog.check_warnings,
+                    interaction.guild,
+                    members,
+                    1,
+                )
+                week, start, end = current_report_period()
+                week_awarded = await asyncio.to_thread(
+                    load_week_awarded,
+                    interaction.guild,
+                    members,
+                    start,
+                    end,
+                )
+            await interaction.followup.send(
+                embed=recheck_embed(week, newly_awarded, week_awarded),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            await voice_audit.db_error(interaction, exc)
+
+    @discord.ui.button(label="이번 주 공지 재전송", emoji="📣", style=discord.ButtonStyle.primary, row=2)
+    async def resend_week(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild_lock = _GUILD_REPORT_LOCKS.setdefault(interaction.guild.id, asyncio.Lock())
+        if guild_lock.locked():
+            await interaction.followup.send("이 서버의 경고 점검 또는 공지 발송이 이미 진행 중입니다.", ephemeral=True)
+            return
+        try:
+            async with guild_lock:
+                channel_id = await asyncio.to_thread(self.cog.get_report_channel_id, interaction.guild.id)
+                if channel_id is None:
+                    await interaction.followup.send(
+                        "경고 공지 채널이 설정되지 않았습니다. 패널의 채널 선택 메뉴에서 먼저 설정해 주세요.",
+                        ephemeral=True,
+                    )
+                    return
+                channel = interaction.guild.get_channel(channel_id) or await self.cog.bot.fetch_channel(channel_id)
+                if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    await interaction.followup.send("설정된 경고 공지 채널을 사용할 수 없습니다.", ephemeral=True)
+                    return
+
+                members = await self.cog.fetch_all_members(interaction.guild)
+                week, start, end = current_report_period()
+                week_awarded = await asyncio.to_thread(
+                    load_week_awarded,
+                    interaction.guild,
+                    members,
+                    start,
+                    end,
+                )
+                embeds = self.cog.build_report_embeds(interaction.guild, week, week_awarded)
+                for embed in embeds:
+                    embed.title = f"{embed.title} · 재전송"
+                    await channel.send(embed=embed)
+            await interaction.followup.send(
+                f"✅ 이번 주 경고 공지를 {channel.mention}에 다시 전송했습니다. "
+                f"대상 **{len(week_awarded)}명**",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await voice_audit.db_error(interaction, exc)
+
     @discord.ui.button(label="3회 경고 명단", emoji="🚪", style=discord.ButtonStyle.secondary, row=3)
     async def three_warning_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -314,6 +459,7 @@ def discipline_panel_embed(
     )
     embed.add_field(name="3회 경고 소프트밴 대상", value=f"{target_count}명", inline=True)
     embed.add_field(name="퇴장 방식", value="DM 후 소프트밴 · 즉시 해제", inline=True)
+    embed.add_field(name="주간 관리", value="재확인 · 공지 재전송 지원", inline=True)
     return embed
 
 
