@@ -1,10 +1,9 @@
-"""Private member report tickets with persistent Discord UI."""
+"""Member reports delivered to one configured staff channel."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-from dataclasses import dataclass
 
 import discord
 from discord import app_commands
@@ -13,37 +12,40 @@ from discord.ext import commands
 from bot.cogs import voice_audit
 
 logger = logging.getLogger(__name__)
-REPORT_PANEL_CUSTOM_ID = "report:create"
-REPORT_CLAIM_CUSTOM_ID = "report:claim"
-REPORT_RESOLVE_CUSTOM_ID = "report:resolve"
-REPORT_REJECT_CUSTOM_ID = "report:reject"
-REPORT_CLOSE_CUSTOM_ID = "report:close"
-
-
-@dataclass(slots=True)
-class ReportConfig:
-    category_id: int
-    staff_role_id: int
+REPORT_PANEL_CUSTOM_ID = "report:create:v2"
+REPORT_CLAIM_CUSTOM_ID = "report:claim:v2"
+REPORT_RESOLVE_CUSTOM_ID = "report:resolve:v2"
+REPORT_REJECT_CUSTOM_ID = "report:reject:v2"
 
 
 def ensure_schema() -> None:
+    """Create or migrate report tables without requiring a category or role."""
     with voice_audit.db() as conn, conn.cursor() as cur:
         cur.execute(
             """
             create table if not exists public.discordbot_report_config (
                 guild_id bigint primary key,
-                category_id bigint not null,
-                staff_role_id bigint not null,
+                report_channel_id bigint,
                 updated_at timestamptz not null default now()
             )
             """
+        )
+        cur.execute(
+            "alter table public.discordbot_report_config add column if not exists report_channel_id bigint"
+        )
+        cur.execute(
+            "alter table public.discordbot_report_config alter column category_id drop not null"
+        )
+        cur.execute(
+            "alter table public.discordbot_report_config alter column staff_role_id drop not null"
         )
         cur.execute(
             """
             create table if not exists public.discordbot_reports (
                 id bigserial primary key,
                 guild_id bigint not null,
-                channel_id bigint unique,
+                channel_id bigint,
+                message_id bigint unique,
                 reporter_id bigint not null,
                 target_id bigint,
                 target_text text not null,
@@ -57,39 +59,43 @@ def ensure_schema() -> None:
             )
             """
         )
+        cur.execute(
+            "alter table public.discordbot_reports add column if not exists message_id bigint"
+        )
+        cur.execute(
+            "create unique index if not exists discordbot_reports_message_id_uq on public.discordbot_reports(message_id) where message_id is not null"
+        )
 
 
-def set_config(guild_id: int, category_id: int, staff_role_id: int) -> None:
+def set_report_channel(guild_id: int, channel_id: int) -> None:
     ensure_schema()
     with voice_audit.db() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            insert into public.discordbot_report_config(guild_id,category_id,staff_role_id,updated_at)
-            values(%s,%s,%s,%s)
+            insert into public.discordbot_report_config(guild_id,report_channel_id,updated_at)
+            values(%s,%s,%s)
             on conflict(guild_id)
-            do update set category_id=excluded.category_id,
-                          staff_role_id=excluded.staff_role_id,
+            do update set report_channel_id=excluded.report_channel_id,
                           updated_at=excluded.updated_at
             """,
-            (guild_id, category_id, staff_role_id, voice_audit.now()),
+            (guild_id, channel_id, voice_audit.now()),
         )
 
 
-def get_config(guild_id: int) -> ReportConfig | None:
+def get_report_channel_id(guild_id: int) -> int | None:
     ensure_schema()
     with voice_audit.db() as conn, conn.cursor() as cur:
         cur.execute(
-            "select category_id,staff_role_id from public.discordbot_report_config where guild_id=%s",
+            "select report_channel_id from public.discordbot_report_config where guild_id=%s",
             (guild_id,),
         )
         row = cur.fetchone()
-    if not row:
-        return None
-    return ReportConfig(category_id=int(row["category_id"]), staff_role_id=int(row["staff_role_id"]))
+    return int(row["report_channel_id"]) if row and row["report_channel_id"] else None
 
 
 def create_report_record(
     guild_id: int,
+    channel_id: int,
     reporter_id: int,
     target_id: int | None,
     target_text: str,
@@ -101,12 +107,13 @@ def create_report_record(
         cur.execute(
             """
             insert into public.discordbot_reports
-            (guild_id,reporter_id,target_id,target_text,reason,details,status,created_at,updated_at)
-            values(%s,%s,%s,%s,%s,%s,'open',%s,%s)
+            (guild_id,channel_id,reporter_id,target_id,target_text,reason,details,status,created_at,updated_at)
+            values(%s,%s,%s,%s,%s,%s,%s,'open',%s,%s)
             returning id
             """,
             (
                 guild_id,
+                channel_id,
                 reporter_id,
                 target_id,
                 target_text,
@@ -119,23 +126,23 @@ def create_report_record(
         return int(cur.fetchone()["id"])
 
 
-def attach_report_channel(report_id: int, channel_id: int) -> None:
+def attach_report_message(report_id: int, message_id: int) -> None:
     with voice_audit.db() as conn, conn.cursor() as cur:
         cur.execute(
-            "update public.discordbot_reports set channel_id=%s,updated_at=%s where id=%s",
-            (channel_id, voice_audit.now(), report_id),
+            "update public.discordbot_reports set message_id=%s,updated_at=%s where id=%s",
+            (message_id, voice_audit.now(), report_id),
         )
 
 
-def get_report_by_channel(channel_id: int) -> dict | None:
+def get_report_by_message(message_id: int) -> dict | None:
     ensure_schema()
     with voice_audit.db() as conn, conn.cursor() as cur:
-        cur.execute("select * from public.discordbot_reports where channel_id=%s", (channel_id,))
+        cur.execute("select * from public.discordbot_reports where message_id=%s", (message_id,))
         return cur.fetchone()
 
 
 def update_report_status(
-    channel_id: int,
+    message_id: int,
     status: str,
     *,
     claimed_by: int | None = None,
@@ -149,9 +156,9 @@ def update_report_status(
                 claimed_by=coalesce(%s,claimed_by),
                 resolved_by=coalesce(%s,resolved_by),
                 updated_at=%s
-            where channel_id=%s
+            where message_id=%s
             """,
-            (status, claimed_by, resolved_by, voice_audit.now(), channel_id),
+            (status, claimed_by, resolved_by, voice_audit.now(), message_id),
         )
 
 
@@ -160,19 +167,24 @@ def parse_user_id(value: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def safe_channel_name(report_id: int, reporter: discord.Member | discord.User) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9가-힣-]", "-", reporter.display_name).strip("-")
-    cleaned = re.sub(r"-+", "-", cleaned)[:30] or str(reporter.id)
-    return f"신고-{report_id}-{cleaned}"[:95]
-
-
-def is_staff(interaction: discord.Interaction, staff_role_id: int | None = None) -> bool:
+def is_staff(interaction: discord.Interaction) -> bool:
     member = interaction.user
-    if not isinstance(member, discord.Member):
-        return False
-    if member.guild_permissions.manage_guild or member.guild_permissions.moderate_members:
-        return True
-    return bool(staff_role_id and any(role.id == staff_role_id for role in member.roles))
+    return isinstance(member, discord.Member) and (
+        member.id == voice_audit.ADMIN_USER_ID
+        or member.guild_permissions.manage_guild
+        or member.guild_permissions.moderate_members
+    )
+
+
+def status_text(status: str, actor_id: int | None = None) -> str:
+    mapping = {
+        "open": "🟡 접수됨 · 담당자 대기",
+        "claimed": "🔵 처리 중",
+        "resolved": "🟢 처리 완료",
+        "rejected": "⚫ 신고 기각",
+    }
+    text = mapping.get(status, status)
+    return f"{text}\n담당 운영진: <@{actor_id}>" if actor_id else text
 
 
 class ReportModal(discord.ui.Modal):
@@ -203,21 +215,23 @@ class ReportModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        if interaction.guild is None:
             await interaction.followup.send("서버 안에서만 신고할 수 있습니다.", ephemeral=True)
             return
 
         try:
-            config = await asyncio.to_thread(get_config, interaction.guild.id)
-            if config is None:
-                await interaction.followup.send("신고 기능 설정이 아직 완료되지 않았습니다.", ephemeral=True)
+            channel_id = await asyncio.to_thread(get_report_channel_id, interaction.guild.id)
+            if channel_id is None:
+                await interaction.followup.send(
+                    "신고 채널이 아직 설정되지 않았습니다. 관리자에게 알려 주세요.",
+                    ephemeral=True,
+                )
                 return
 
-            category = interaction.guild.get_channel(config.category_id)
-            staff_role = interaction.guild.get_role(config.staff_role_id)
-            if not isinstance(category, discord.CategoryChannel) or staff_role is None:
+            channel = interaction.guild.get_channel(channel_id) or await interaction.client.fetch_channel(channel_id)
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
                 await interaction.followup.send(
-                    "설정된 신고 카테고리 또는 관리자 역할을 찾을 수 없습니다. 관리자에게 알려 주세요.",
+                    "설정된 신고 채널을 사용할 수 없습니다. 관리자에게 알려 주세요.",
                     ephemeral=True,
                 )
                 return
@@ -227,6 +241,7 @@ class ReportModal(discord.ui.Modal):
             report_id = await asyncio.to_thread(
                 create_report_record,
                 interaction.guild.id,
+                channel.id,
                 interaction.user.id,
                 target_id,
                 target_text,
@@ -234,66 +249,40 @@ class ReportModal(discord.ui.Modal):
                 str(self.details.value).strip(),
             )
 
-            bot_member = interaction.guild.me
-            overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
-                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                interaction.user: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=True,
-                    embed_links=True,
-                ),
-                staff_role: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    manage_messages=True,
-                    attach_files=True,
-                    embed_links=True,
-                ),
-            }
-            if bot_member is not None:
-                overwrites[bot_member] = discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    manage_channels=True,
-                    manage_messages=True,
-                )
-
-            channel = await interaction.guild.create_text_channel(
-                safe_channel_name(report_id, interaction.user),
-                category=category,
-                topic=f"report_id={report_id}; reporter_id={interaction.user.id}; target_id={target_id or 0}",
-                overwrites=overwrites,
-                reason=f"멤버 신고 #{report_id} 접수",
+            target_display = (
+                f"<@{target_id}> (`{target_id}`)"
+                if target_id
+                else discord.utils.escape_markdown(target_text)
             )
-            await asyncio.to_thread(attach_report_channel, report_id, channel.id)
-
-            target_display = f"<@{target_id}> (`{target_id}`)" if target_id else discord.utils.escape_markdown(target_text)
             embed = discord.Embed(title=f"🚨 멤버 신고 #{report_id}", color=0xED4245)
-            embed.description = "신고 내용은 신고자와 운영진만 확인할 수 있습니다."
-            embed.add_field(name="신고자", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            embed.description = "신고 패널을 통해 접수된 관리자 확인용 신고입니다."
+            embed.add_field(
+                name="신고자",
+                value=f"{interaction.user.mention} (`{interaction.user.id}`)",
+                inline=False,
+            )
             embed.add_field(name="신고 대상", value=target_display, inline=False)
             embed.add_field(name="신고 사유", value=str(self.reason.value)[:1024], inline=False)
             embed.add_field(name="상세 내용 및 증거", value=str(self.details.value)[:1024], inline=False)
-            embed.add_field(name="처리 상태", value="🟡 접수됨 · 담당자 대기", inline=False)
-            embed.set_footer(text="허위 신고 또는 신고 내용의 외부 공유는 제재될 수 있습니다.")
+            embed.add_field(name="처리 상태", value=status_text("open"), inline=False)
+            embed.set_footer(text="허위 신고는 제재될 수 있습니다.")
 
-            await channel.send(
-                content=f"{interaction.user.mention} {staff_role.mention}",
+            message = await channel.send(
                 embed=embed,
                 view=ReportManageView(),
-                allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
+            await asyncio.to_thread(attach_report_message, report_id, message.id)
             await interaction.followup.send(
-                f"✅ 신고가 접수되었습니다. 운영진과 대화할 수 있는 채널: {channel.mention}",
+                f"✅ 신고가 접수되었습니다. 신고 번호는 **#{report_id}**입니다.",
                 ephemeral=True,
             )
         except discord.Forbidden:
-            logger.exception("신고 채널 생성 권한 부족")
-            await interaction.followup.send("신고 채널을 만들 권한이 봇에 없습니다.", ephemeral=True)
+            logger.exception("신고 채널 전송 권한 부족")
+            await interaction.followup.send(
+                "봇이 신고 채널을 보거나 메시지를 보낼 권한이 없습니다.",
+                ephemeral=True,
+            )
         except Exception as exc:
             logger.exception("신고 접수 실패", exc_info=exc)
             await interaction.followup.send(
@@ -321,63 +310,53 @@ class ReportManageView(discord.ui.View):
         super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.guild is None:
-            return False
-        try:
-            config = await asyncio.to_thread(get_config, interaction.guild.id)
-        except Exception:
-            config = None
-        if is_staff(interaction, config.staff_role_id if config else None):
+        if is_staff(interaction):
             return True
         await interaction.response.send_message("운영진만 처리할 수 있습니다.", ephemeral=True)
         return False
 
-    async def _update(
+    async def _change_status(
         self,
         interaction: discord.Interaction,
         *,
         status: str,
-        label: str,
         color: int,
-        close_after: bool = False,
     ) -> None:
+        if interaction.message is None:
+            await interaction.response.send_message("신고 메시지를 찾을 수 없습니다.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        report = await asyncio.to_thread(get_report_by_channel, interaction.channel_id)
+        report = await asyncio.to_thread(get_report_by_message, interaction.message.id)
         if report is None:
-            await interaction.followup.send("이 채널의 신고 정보를 찾을 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("신고 DB 기록을 찾을 수 없습니다.", ephemeral=True)
             return
 
         claimed_by = interaction.user.id if status == "claimed" else None
         resolved_by = interaction.user.id if status in {"resolved", "rejected"} else None
         await asyncio.to_thread(
             update_report_status,
-            interaction.channel_id,
+            interaction.message.id,
             status,
             claimed_by=claimed_by,
             resolved_by=resolved_by,
         )
 
-        embed = discord.Embed(title=f"{label} 신고 처리 상태 변경", color=color)
-        embed.description = f"담당 운영진: {interaction.user.mention}\n상태: **{status}**"
-        await interaction.channel.send(embed=embed)
+        embed = interaction.message.embeds[0].copy() if interaction.message.embeds else discord.Embed()
+        field_index = next(
+            (index for index, field in enumerate(embed.fields) if field.name == "처리 상태"),
+            None,
+        )
+        value = status_text(status, interaction.user.id)
+        if field_index is None:
+            embed.add_field(name="처리 상태", value=value, inline=False)
+        else:
+            embed.set_field_at(field_index, name="처리 상태", value=value, inline=False)
+        embed.color = color
 
-        if isinstance(interaction.channel, discord.TextChannel):
-            prefix = {"claimed": "처리중", "resolved": "완료", "rejected": "기각"}.get(status)
-            if prefix:
-                base = re.sub(r"^(처리중|완료|기각)-", "", interaction.channel.name)
-                try:
-                    await interaction.channel.edit(name=f"{prefix}-{base}"[:95])
-                except discord.HTTPException:
-                    pass
-            if close_after:
-                reporter = interaction.guild.get_member(int(report["reporter_id"]))
-                if reporter is not None:
-                    try:
-                        await interaction.channel.set_permissions(reporter, send_messages=False)
-                    except discord.HTTPException:
-                        pass
-
-        await interaction.followup.send(f"✅ 신고 상태를 `{status}`(으)로 변경했습니다.", ephemeral=True)
+        for child in self.children:
+            child.disabled = status in {"resolved", "rejected"}
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.followup.send("신고 처리 상태를 변경했습니다.", ephemeral=True)
 
     @discord.ui.button(
         label="담당하기",
@@ -386,7 +365,7 @@ class ReportManageView(discord.ui.View):
         custom_id=REPORT_CLAIM_CUSTOM_ID,
     )
     async def claim(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._update(interaction, status="claimed", label="🙋", color=0x5865F2)
+        await self._change_status(interaction, status="claimed", color=0x5865F2)
 
     @discord.ui.button(
         label="처리 완료",
@@ -395,86 +374,68 @@ class ReportManageView(discord.ui.View):
         custom_id=REPORT_RESOLVE_CUSTOM_ID,
     )
     async def resolve(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._update(interaction, status="resolved", label="✅", color=0x57F287, close_after=True)
+        await self._change_status(interaction, status="resolved", color=0x57F287)
 
     @discord.ui.button(
         label="신고 기각",
-        emoji="⛔",
+        emoji="✖️",
         style=discord.ButtonStyle.secondary,
         custom_id=REPORT_REJECT_CUSTOM_ID,
     )
     async def reject(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await self._update(interaction, status="rejected", label="⛔", color=0x747F8D, close_after=True)
-
-    @discord.ui.button(
-        label="채널 삭제",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-        custom_id=REPORT_CLOSE_CUSTOM_ID,
-    )
-    async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message("5초 후 신고 채널을 삭제합니다.", ephemeral=True)
-        await asyncio.sleep(5)
-        if interaction.channel is not None:
-            await interaction.channel.delete(reason=f"신고 채널 삭제: {interaction.user}")
+        await self._change_status(interaction, status="rejected", color=0x747F8D)
 
 
 class ReportSystemCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        bot.add_view(ReportPanelView())
+        bot.add_view(ReportManageView())
 
-    async def cog_load(self) -> None:
-        await asyncio.to_thread(ensure_schema)
-        self.bot.add_view(ReportPanelView())
-        self.bot.add_view(ReportManageView())
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        try:
+            await asyncio.to_thread(ensure_schema)
+        except Exception:
+            logger.exception("신고 기능 DB 초기화 실패")
 
-    @app_commands.command(name="신고설정", description="[관리자] 신고 티켓 카테고리와 운영진 역할을 설정합니다.")
-    @app_commands.describe(category="신고 채널이 생성될 카테고리", staff_role="신고를 확인할 운영진 역할")
-    @app_commands.default_permissions(manage_guild=True)
-    async def report_setup(
+    @app_commands.command(name="신고설정", description="[관리자] 신고 내용이 전송될 채널을 설정합니다.")
+    @app_commands.describe(channel="신고 내용이 전송될 관리자 채널")
+    async def report_settings(
         self,
         interaction: discord.Interaction,
-        category: discord.CategoryChannel,
-        staff_role: discord.Role,
+        channel: discord.TextChannel,
     ) -> None:
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+        if not is_staff(interaction):
+            await interaction.response.send_message("운영진만 설정할 수 있습니다.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await asyncio.to_thread(set_config, interaction.guild.id, category.id, staff_role.id)
+            await asyncio.to_thread(set_report_channel, interaction.guild.id, channel.id)
             await interaction.followup.send(
-                f"✅ 신고 기능 설정 완료\n카테고리: **{category.name}**\n운영진 역할: {staff_role.mention}",
+                f"✅ 신고 채널을 {channel.mention}(으)로 설정했습니다.",
                 ephemeral=True,
             )
         except Exception as exc:
-            logger.exception("신고 설정 저장 실패", exc_info=exc)
-            await interaction.followup.send(f"설정 저장 실패: `{type(exc).__name__}`", ephemeral=True)
+            logger.exception("신고 채널 설정 실패", exc_info=exc)
+            await interaction.followup.send(
+                f"❌ 신고 채널 설정 실패: `{type(exc).__name__}`",
+                ephemeral=True,
+            )
 
-    @app_commands.command(name="신고패널", description="[관리자] 멤버 신고 접수 패널을 현재 채널에 설치합니다.")
-    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.command(name="신고패널", description="[관리자] 현재 채널에 신고 패널을 설치합니다.")
     async def report_panel(self, interaction: discord.Interaction) -> None:
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+        if not is_staff(interaction):
+            await interaction.response.send_message("운영진만 설치할 수 있습니다.", ephemeral=True)
             return
-        config = await asyncio.to_thread(get_config, interaction.guild.id)
-        if config is None:
-            await interaction.response.send_message("먼저 `/신고설정`을 실행해 주세요.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="🚨 멤버 신고 접수", color=0xED4245)
+        embed = discord.Embed(title="🚨 멤버 신고", color=0xED4245)
         embed.description = (
-            "서버 규칙 위반, 욕설, 괴롭힘, 분쟁 유도 등을 운영진에게 비공개로 신고할 수 있습니다.\n\n"
-            "아래 버튼을 누른 뒤 신고 대상과 구체적인 상황을 작성해 주세요. "
-            "신고가 접수되면 신고자와 운영진만 볼 수 있는 전용 채널이 생성됩니다."
+            "아래 버튼을 눌러 운영진에게 멤버를 신고할 수 있습니다.\n"
+            "신고 내용은 설정된 관리자 채널로만 전송됩니다.\n\n"
+            "신고 대상, 사유, 발생 상황과 증거를 가능한 자세히 적어 주세요."
         )
-        embed.add_field(
-            name="신고 전에 확인해 주세요",
-            value="• 가능한 한 메시지 링크와 발생 시각을 포함해 주세요.\n• 허위·보복성 신고는 제재될 수 있습니다.\n• 신고 내용은 외부에 공유하지 마세요.",
-            inline=False,
-        )
-        await interaction.channel.send(embed=embed, view=ReportPanelView())
-        await interaction.response.send_message("✅ 신고 패널을 설치했습니다.", ephemeral=True)
+        embed.set_footer(text="허위 신고 또는 악의적인 반복 신고는 제재될 수 있습니다.")
+        await interaction.response.send_message(embed=embed, view=ReportPanelView())
 
 
 async def setup(bot: commands.Bot) -> None:
