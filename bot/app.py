@@ -45,7 +45,14 @@ class DiscordBot(commands.Bot):
         )
 
     async def _sync_guild_only_commands(self) -> None:
-        """현재 명령어를 각 서버에 즉시 등록하고 전역 명령어는 제거한다."""
+        """현재 명령어를 각 서버에 즉시 등록한다.
+
+        전역 명령어의 일괄 덮어쓰기는 수행하지 않는다. Discord Activity가
+        활성화된 앱에는 삭제할 수 없는 PRIMARY_ENTRY_POINT 명령이 존재하며,
+        빈 목록으로 전역 명령을 동기화하면 API 오류 50240이 발생한다.
+        길드 명령은 같은 이름의 전역 명령보다 우선하므로 서버 내 사용에는
+        영향이 없다.
+        """
         for guild in self.guilds:
             guild_object = discord.Object(id=guild.id)
             try:
@@ -62,13 +69,9 @@ class DiscordBot(commands.Bot):
                     len(synced),
                 )
 
-        try:
-            self.tree.clear_commands(guild=None)
-            removed = await self.tree.sync()
-        except discord.HTTPException:
-            logger.exception("전역 명령어 제거 실패")
-        else:
-            logger.info("전역 명령어 제거 완료: 원격 전역 명령어 %s개", len(removed))
+        logger.info(
+            "전역 명령어 일괄 정리 건너뜀: Discord Activity Entry Point 보호"
+        )
 
     async def _load_extensions(self) -> None:
         cogs_dir = Path(__file__).parent / "cogs"
